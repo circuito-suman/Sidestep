@@ -1,6 +1,6 @@
 # <img src="icons/svg/app.svg" alt="Sidestep icon" width="60" align="absmiddle"> Sidestep
 
-A Windows and Linux application that gets game stores (Steam, GOG, Epic, etc.) and _many other sites_ past campus firewalls (even many network provider firewalls) that block by site name (SNI). It runs GoodbyeDPI on Windows and ByeDPI on Linux underneath, checks whether the bypass is actually working, and tunes it for your network on its own.
+A Windows, Linux, and macOS application that gets game stores (Steam, GOG, Epic, etc.) and _many other sites_ past campus firewalls (even many network provider firewalls) that block by site name (SNI). It runs GoodbyeDPI on Windows and ByeDPI on Linux and macOS underneath, checks whether the bypass is actually working, and tunes it for your network on its own.
 
 ![Steam's store fails with "The connection was reset" while Sidestep is off; Sidestep is turned on, goes from Starting to Bypass is on, and the store loads after a refresh](docs/images/sidestep-demo.gif)
 
@@ -53,6 +53,17 @@ chmod +x ./Sidestep
 ./Sidestep install       # optional: install to ~/.local/bin and add a desktop launcher
 ```
 
+**macOS (Apple Silicon & Intel) — launch the GUI/Menu Bar app or run from Terminal:**
+
+```sh
+chmod +x ./Sidestep
+./Sidestep               # launch GUI window + Menu Bar status icon
+./Sidestep on            # start bypass and configure macOS networksetup SOCKS5 proxy
+./Sidestep install       # optional: install CLI to ~/.local/bin and extract ciadpi to Application Support
+```
+
+Place an empty `sidestep.portable` file or folder next to the binary on macOS to isolate all writes to `Sidestep-data/`.
+
 ---
 
 ## Need Android?
@@ -80,6 +91,14 @@ Standard desktop graphical libraries are required to compile the Linux GUI:
   sudo pacman -S libxkbcommon mesa
   ```
 
+### Prerequisites (macOS)
+
+Xcode Command Line Tools provide Apple Clang, `lipo`, and the macOS frameworks required by `eframe`:
+
+```sh
+xcode-select --install
+```
+
 ### Compiling
 ```sh
 # On Linux (X11 & Wayland): produces a single self-contained binary
@@ -87,6 +106,17 @@ cargo build --release            # target/release/Sidestep
 
 # On Windows (x86_64-pc-windows-msvc or GNU):
 cargo build --release            # target/release/Sidestep.exe
+
+# On macOS (arm64 or x86_64):
+cargo build --release            # target/release/Sidestep
+
+# Optional Universal 2 macOS binary (Apple Silicon + Intel):
+cargo build --release --target aarch64-apple-darwin
+cargo build --release --target x86_64-apple-darwin
+lipo -create \
+  target/aarch64-apple-darwin/release/Sidestep \
+  target/x86_64-apple-darwin/release/Sidestep \
+  -output target/release/Sidestep-universal
 ```
 
 The release build produces a single self-contained binary with vendor engines embedded; share it as-is.
@@ -99,6 +129,7 @@ cargo build --features preview   # Windows UI-only build, no admin, never starts
 ```
 
 > **Linux on non-x86_64 or packaging without vendored binaries?** See [docs/linux-ciadpi.md](docs/linux-ciadpi.md).
+> **macOS `ciadpi-darwin` details or building from source?** See [docs/macos-ciadpi.md](docs/macos-ciadpi.md).
 
 ### Linux CLI Usage
 
@@ -148,14 +179,19 @@ curl --proxy socks5h://127.0.0.1:1080 https://store.steampowered.com
 
 The port `1080` is the default; it can be changed in Sidestep's Flags tab with `-p <port>`.
 
+### macOS CLI & Proxy Routing
+
+The macOS CLI supports the same commands (`on`, `off`, `status`, `check`, `tune`, `install`, `uninstall`, `autostart enable|disable`). Sidestep configures the active interface's SOCKS5 proxy automatically via `networksetup`, and writes `proxy.env` (`all_proxy="socks5h://127.0.0.1:1080"`) in `~/Library/Application Support/Sidestep/` (or `Sidestep-data/` in portable mode) for terminal tools.
+
 ---
 
 ## Limitations
 
 - **Name filtering only.** If a server's IP address is blocked, Sidestep has no effect.
 - **Can break.** A firewall update can stop a working setup; the periodic check and TTL search are there to recover from that. (if it breaks, raise an issue, and I'll try to look into it)
-- Supports **Windows x64**, **Linux x86_64** (GUI + CLI), and other Linux architectures
-  (CLI only, requires [building ciadpi from source](docs/linux-ciadpi.md)).
+- Supports **Windows x64**, **Linux x86_64** (GUI + CLI), other Linux architectures
+  (CLI only, requires [building ciadpi from source](docs/linux-ciadpi.md)), and
+  **macOS** (`arm64` Apple Silicon & `x86_64` Intel, GUI + Menu Bar + CLI, see [docs/macos-ciadpi.md](docs/macos-ciadpi.md)).
   Android: [docs/android.md](docs/android.md).
 
 ---
