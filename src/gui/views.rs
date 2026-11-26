@@ -175,7 +175,17 @@ impl SidestepApp {
         verify: Verify,
         tex: &AppTextures,
     ) {
-        let (pid_str, uptime, ttl_str, flags_str, last_detail, passed, blocked, is_running) = {
+        let (
+            pid_str,
+            uptime,
+            ttl_str,
+            flags_str,
+            last_detail,
+            passed,
+            blocked,
+            is_running,
+            is_busy_job,
+        ) = {
             let st = self.state.lock().unwrap();
             let pid = st.engine_pid.map_or("none".into(), |p| p.to_string());
             let ttl = st.current_ttl.map_or("none".into(), |t| t.to_string());
@@ -188,6 +198,7 @@ impl SidestepApp {
                 st.checks_passed,
                 st.checks_blocked,
                 st.engine_pid.is_some() || st.view != View::Off,
+                st.probing || st.tuning,
             )
         };
 
@@ -202,8 +213,13 @@ impl SidestepApp {
                     ui.label(RichText::new("Engine").color(Color32::from_rgb(100, 105, 115)));
                 });
                 if is_running {
+                    let engine_label = if cfg!(target_os = "macos") {
+                        "ciadpi (running)"
+                    } else {
+                        "goodbyedpi (running)"
+                    };
                     ui.label(
-                        RichText::new("goodbyedpi (running)")
+                        RichText::new(engine_label)
                             .color(Color32::from_rgb(40, 167, 69))
                             .strong(),
                     );
@@ -279,7 +295,10 @@ impl SidestepApp {
                 " Check now",
             )
             .min_size(Vec2::new(110.0, 32.0));
-            if ui.add_enabled(is_running, check_btn).clicked() {
+            if ui
+                .add_enabled(is_running && !is_busy_job, check_btn)
+                .clicked()
+            {
                 let _ = self.cmd_tx.send(UiCmd::CheckNow);
             }
 
@@ -288,7 +307,7 @@ impl SidestepApp {
                 " Find TTL now",
             )
             .min_size(Vec2::new(120.0, 32.0));
-            if ui.add(tune_btn).clicked() {
+            if ui.add_enabled(!is_busy_job, tune_btn).clicked() {
                 let _ = self.cmd_tx.send(UiCmd::TuneNow);
             }
 
@@ -579,7 +598,11 @@ impl SidestepApp {
             if ui
                 .checkbox(
                     &mut self.autostart_val,
-                    "Launch Sidestep at logon (tray icon always visible)",
+                    if cfg!(target_os = "macos") {
+                        "Launch Sidestep at logon (LaunchAgent)"
+                    } else {
+                        "Launch Sidestep at logon (tray icon always visible)"
+                    },
                 )
                 .changed()
             {

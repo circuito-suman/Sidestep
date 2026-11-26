@@ -55,7 +55,26 @@ pub fn probe_all(sites: &[String]) -> (Verdict, Vec<SiteResult>) {
 }
 
 pub fn probe_all_via(sites: &[String], proxy: Option<SocketAddr>) -> (Verdict, Vec<SiteResult>) {
-    let results: Vec<SiteResult> = sites.iter().map(|h| probe_site_via(h, proxy)).collect();
+    let results: Vec<SiteResult> = if sites.len() <= 1 {
+        sites.iter().map(|h| probe_site_via(h, proxy)).collect()
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = sites
+                .iter()
+                .map(|h| scope.spawn(move || probe_site_via(h, proxy)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| SiteResult {
+                        host: String::new(),
+                        verdict: Verdict::Unreachable,
+                        detail: "probe thread panicked".into(),
+                    })
+                })
+                .collect()
+        })
+    };
     let v = if results.iter().any(|r| r.verdict == Verdict::Blocked) {
         Verdict::Blocked
     } else if results.iter().any(|r| r.verdict == Verdict::Pass) {
@@ -128,13 +147,17 @@ fn socks5_connect(
     let mut reply = [0u8; 4];
     if let Err(e) = s.read_exact(&mut reply) {
         return Err((
-            Verdict::Blocked,
+            Verdict::Unreachable,
             format!("SOCKS5 connect reply read failed: {e}"),
         ));
     }
     if reply[0] != 0x05 || reply[1] != 0x00 {
+        let verdict = match reply[1] {
+            0x01 | 0x03..=0x06 => Verdict::Unreachable,
+            _ => Verdict::Blocked,
+        };
         return Err((
-            Verdict::Blocked,
+            verdict,
             format!("SOCKS5 connect rejected with status 0x{:02x}", reply[1]),
         ));
     }
@@ -351,5 +374,24 @@ mod tests {
         assert_eq!(rec_len, h.len() - 5);
         let hs_len = u32::from_be_bytes([0, h[6], h[7], h[8]]) as usize;
         assert_eq!(hs_len, h.len() - 9);
+    }
+
+    #[test]
+    fn socks5_unreachable_reply_is_unreachable() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 64];
+                let _ = conn.read(&mut buf);
+                let _ = conn.write_all(&[0x05, 0x00]);
+                let _ = conn.read(&mut buf);
+                // 0x04 = Host unreachable
+                let _ = conn.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            }
+        });
+        let res = probe_site_via("epicgames.com", Some(addr));
+        assert_eq!(res.verdict, Verdict::Unreachable);
     }
 }
