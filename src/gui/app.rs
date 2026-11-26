@@ -5,7 +5,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::icons::AppTextures;
+#[cfg(target_os = "macos")]
+use super::state::View;
 use super::state::{AppState, UiCmd};
+#[cfg(target_os = "macos")]
+use super::tray_macos::MacTray;
 use eframe::egui::{self, Color32};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -30,10 +34,16 @@ pub struct SidestepApp {
     pub(crate) log_wrap: bool,
     pub(crate) is_window_shown: bool,
     pub(crate) textures: Option<AppTextures>,
+    #[cfg(target_os = "macos")]
+    pub(crate) mac_tray: Option<MacTray>,
 }
 
 impl SidestepApp {
-    pub fn new(state: Arc<Mutex<AppState>>, cmd_tx: Sender<UiCmd>) -> Self {
+    pub fn new(
+        state: Arc<Mutex<AppState>>,
+        cmd_tx: Sender<UiCmd>,
+        #[cfg(target_os = "macos")] mac_tray: Option<MacTray>,
+    ) -> Self {
         let (flags, sites, secs, autotune, log_wrap) = {
             let st = state.lock().unwrap();
             (
@@ -60,6 +70,8 @@ impl SidestepApp {
             log_wrap,
             is_window_shown: false,
             textures: None,
+            #[cfg(target_os = "macos")]
+            mac_tray,
         }
     }
 }
@@ -89,10 +101,25 @@ impl eframe::App for SidestepApp {
 
         // Check if supervisor requested window presentation or shutdown
         let (should_exit, show_window, view, verify) = {
-            let st = self.state.lock().unwrap();
-            let show = st.window_visible && !self.is_window_shown;
-            if show {
-                self.is_window_shown = true;
+            let mut st = self.state.lock().unwrap();
+            let show = if cfg!(target_os = "macos") {
+                let s = st.window_visible;
+                if s {
+                    st.window_visible = false;
+                    self.is_window_shown = true;
+                }
+                s
+            } else {
+                let s = st.window_visible && !self.is_window_shown;
+                if s {
+                    self.is_window_shown = true;
+                }
+                s
+            };
+            #[cfg(target_os = "macos")]
+            if let Some(ref mut tray) = self.mac_tray {
+                let is_running = st.engine_pid.is_some() || st.view != View::Off;
+                tray.sync(st.view, is_running);
             }
             (st.should_exit, show, st.view, st.verify)
         };

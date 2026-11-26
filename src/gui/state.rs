@@ -1,10 +1,12 @@
-//! Shared application state and background supervisor for the Linux GUI.
+//! Shared application state and background supervisor for the Unix GUI.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -141,6 +143,9 @@ pub struct Supervisor {
     state: Arc<Mutex<AppState>>,
     cmd_rx: Receiver<UiCmd>,
     exe: PathBuf,
+    eng: Arc<Mutex<Engine>>,
+    worker: Option<JoinHandle<()>>,
+    worker_cancel: Arc<AtomicBool>,
 }
 
 impl Supervisor {
@@ -148,20 +153,89 @@ impl Supervisor {
         state: Arc<Mutex<AppState>>,
         cmd_rx: Receiver<UiCmd>,
         exe: PathBuf,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> JoinHandle<()> {
         std::thread::Builder::new()
             .name("sidestep-supervisor".into())
             .spawn(move || {
-                let mut sup = Supervisor { state, cmd_rx, exe };
+                let mut sup = Supervisor {
+                    state,
+                    cmd_rx,
+                    exe,
+                    eng: Arc::new(Mutex::new(Engine::default())),
+                    worker: None,
+                    worker_cancel: Arc::new(AtomicBool::new(false)),
+                };
                 sup.run();
             })
             .expect("failed to spawn supervisor thread")
     }
 
+    fn reap_finished_worker(&mut self) {
+        if self.worker.as_ref().is_some_and(|h| h.is_finished()) {
+            if let Some(h) = self.worker.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Cancels any active probe/tune worker, stopping `ciadpi` to unblock in-flight sockets immediately.
+    fn cancel_and_join_worker(&mut self) {
+        self.worker_cancel.store(true, Ordering::SeqCst);
+        {
+            let mut eng = self.eng.lock().unwrap();
+            eng.stop();
+        }
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+    }
+
+    fn spawn_check_worker(&mut self, tx: &Sender<Ev>) {
+        self.reap_finished_worker();
+        if self.worker.is_some() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.worker_cancel = cancel.clone();
+        let state = self.state.clone();
+        let eng = self.eng.clone();
+        let exe = self.exe.clone();
+        let tx = tx.clone();
+
+        self.worker = std::thread::Builder::new()
+            .name("sidestep-worker".into())
+            .spawn(move || {
+                let should_tune = run_check_once(&state, &eng, &cancel);
+                if should_tune && !cancel.load(Ordering::SeqCst) {
+                    run_tune_loop(&state, &eng, &tx, &exe, &cancel);
+                }
+            })
+            .ok();
+    }
+
+    fn spawn_tune_worker(&mut self, tx: &Sender<Ev>) {
+        self.reap_finished_worker();
+        if self.worker.is_some() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.worker_cancel = cancel.clone();
+        let state = self.state.clone();
+        let eng = self.eng.clone();
+        let exe = self.exe.clone();
+        let tx = tx.clone();
+
+        self.worker = std::thread::Builder::new()
+            .name("sidestep-worker".into())
+            .spawn(move || {
+                run_tune_loop(&state, &eng, &tx, &exe, &cancel);
+            })
+            .ok();
+    }
+
     fn run(&mut self) {
         let (tx, rx) = channel();
-        let mut eng = Engine::default();
-        let mut next_check = Instant::now() + Duration::from_secs(999999);
+        let mut next_check = Instant::now() + Duration::from_secs(999_999);
 
         // Clean up any stale engine instances from past runs
         for pid in engine::find_goodbyedpi_pids() {
@@ -180,13 +254,17 @@ impl Supervisor {
         }
 
         while !self.state.lock().unwrap().should_exit {
-            // 1. Process any incoming commands
+            self.reap_finished_worker();
+
+            // 1. Process incoming commands immediately (never blocked by probe/tune)
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 match cmd {
                     UiCmd::Toggle => {
-                        let is_running = eng.is_running();
-                        if is_running {
-                            eng.stop();
+                        let is_active = self.worker.is_some()
+                            || self.eng.lock().unwrap().is_running()
+                            || self.state.lock().unwrap().view != View::Off;
+                        if is_active {
+                            self.cancel_and_join_worker();
                             proxy::clear_socks_proxy();
                             let mut st = self.state.lock().unwrap();
                             st.view = View::Off;
@@ -195,25 +273,34 @@ impl Supervisor {
                             st.started_at = None;
                             st.probing = false;
                             st.tuning = false;
+                            st.tuning_step = None;
                             st.add_log("Bypass is off. System proxy restored to Direct.");
                         } else {
-                            self.start_engine(&mut eng, &tx);
+                            self.start_engine(&tx);
                             next_check = Instant::now() + Duration::from_millis(500);
                         }
                     }
                     UiCmd::CheckNow => {
-                        if eng.is_running() {
-                            self.run_check(&eng);
+                        let running = self.eng.lock().unwrap().is_running();
+                        if running && self.worker.is_none() {
+                            self.spawn_check_worker(&tx);
                             let secs = self.state.lock().unwrap().config.check_secs;
                             next_check = Instant::now() + Duration::from_secs(secs);
                         }
                     }
                     UiCmd::TuneNow => {
-                        self.run_tune(&mut eng, &tx);
-                        let secs = self.state.lock().unwrap().config.check_secs;
-                        next_check = Instant::now() + Duration::from_secs(secs);
+                        if self.worker.is_none() {
+                            self.spawn_tune_worker(&tx);
+                            let secs = self.state.lock().unwrap().config.check_secs;
+                            next_check = Instant::now() + Duration::from_secs(secs);
+                        }
                     }
                     UiCmd::ApplyFlags(new_flags) => {
+                        let was_active =
+                            self.worker.is_some() || self.eng.lock().unwrap().is_running();
+                        if was_active {
+                            self.cancel_and_join_worker();
+                        }
                         let mut st = self.state.lock().unwrap();
                         st.config.flags = new_flags.clone();
                         st.active_flags = new_flags.clone();
@@ -222,8 +309,8 @@ impl Supervisor {
                         st.add_log(format!("Updated flags: {new_flags}"));
                         drop(st);
 
-                        if eng.is_running() {
-                            self.start_engine(&mut eng, &tx);
+                        if was_active {
+                            self.start_engine(&tx);
                             next_check = Instant::now() + Duration::from_millis(500);
                         }
                     }
@@ -243,6 +330,10 @@ impl Supervisor {
                 }
             }
 
+            if self.state.lock().unwrap().should_exit {
+                break;
+            }
+
             // 2. Drain any output lines from child process
             while let Ok(ev) = rx.try_recv() {
                 if let Ev::GdpiLine(_, line) = ev {
@@ -254,44 +345,41 @@ impl Supervisor {
                 }
             }
 
-            // 3. Poll engine liveness
-            if let Some(msg) = eng.poll() {
-                proxy::clear_socks_proxy();
-                let mut st = self.state.lock().unwrap();
-                st.view = View::Off;
-                st.verify = Verify::Unknown;
-                st.engine_pid = None;
-                st.started_at = None;
-                st.probing = false;
-                st.tuning = false;
-                st.add_log(format!("Bypass stopped: {msg}"));
+            // 3. Poll engine liveness (only when worker isn't actively swapping engine)
+            if self.worker.is_none() {
+                let exited = self.eng.lock().unwrap().poll();
+                if let Some(msg) = exited {
+                    proxy::clear_socks_proxy();
+                    let mut st = self.state.lock().unwrap();
+                    st.view = View::Off;
+                    st.verify = Verify::Unknown;
+                    st.engine_pid = None;
+                    st.started_at = None;
+                    st.probing = false;
+                    st.tuning = false;
+                    st.tuning_step = None;
+                    st.add_log(format!("Bypass stopped: {msg}"));
+                }
             }
 
             // 4. Periodic health check
-            if eng.is_running() && Instant::now() >= next_check {
-                self.run_check(&eng);
-                let (autotune, blocked, secs) = {
-                    let st = self.state.lock().unwrap();
-                    (
-                        st.config.autotune,
-                        st.verify == Verify::Blocked,
-                        st.config.check_secs,
-                    )
-                };
-                if blocked && autotune {
-                    self.run_tune(&mut eng, &tx);
-                }
+            if self.worker.is_none()
+                && self.eng.lock().unwrap().is_running()
+                && Instant::now() >= next_check
+            {
+                self.spawn_check_worker(&tx);
+                let secs = self.state.lock().unwrap().config.check_secs;
                 next_check = Instant::now() + Duration::from_secs(secs);
             }
 
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        eng.stop();
+        self.cancel_and_join_worker();
         proxy::clear_socks_proxy();
     }
 
-    fn start_engine(&self, eng: &mut Engine, tx: &Sender<Ev>) {
+    fn start_engine(&self, tx: &Sender<Ev>) {
         let (flags, port) = {
             let mut st = self.state.lock().unwrap();
             st.view = View::Starting;
@@ -315,12 +403,18 @@ impl Supervisor {
                 args
             );
         }
-        match eng.start(&self.exe, &args, tx) {
+        let start_res = {
+            let mut eng = self.eng.lock().unwrap();
+            eng.start(&self.exe, &args, tx)
+        };
+        match start_res {
             Ok(pid) => {
                 proxy::set_socks_proxy(port);
                 let mut st = self.state.lock().unwrap();
                 st.engine_pid = Some(pid);
                 st.started_at = Some(Instant::now());
+                st.active_flags = flags.clone();
+                st.current_ttl = flags::get_ttl(&flags);
                 st.view = View::Checking;
                 st.add_log(format!(
                     "ciadpi started (PID {pid}). System proxy set to 127.0.0.1:{port}."
@@ -333,147 +427,231 @@ impl Supervisor {
             }
         }
     }
+}
 
-    fn run_check(&self, eng: &Engine) {
-        if !eng.is_running() {
-            return;
+/// Runs a single parallel connectivity probe without holding locks.
+/// Returns `true` if the verdict is `Blocked` and `autotune` is enabled.
+fn run_check_once(
+    state: &Arc<Mutex<AppState>>,
+    eng: &Arc<Mutex<Engine>>,
+    cancel: &Arc<AtomicBool>,
+) -> bool {
+    if cancel.load(Ordering::SeqCst) || !eng.lock().unwrap().is_running() {
+        return false;
+    }
+
+    let (sites, port) = {
+        let mut st = state.lock().unwrap();
+        st.probing = true;
+        st.view = View::Checking;
+        (
+            probe::parse_sites(&st.config.sites),
+            flags::parse_proxy_port(&st.config.flags),
+        )
+    };
+
+    let proxy: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (verdict, results) = probe::probe_all_via(&sites, Some(proxy));
+
+    if cancel.load(Ordering::SeqCst) {
+        let mut st = state.lock().unwrap();
+        st.probing = false;
+        return false;
+    }
+
+    if is_debug() {
+        eprintln!(
+            "[DEBUG/probe] Probe verdict: {:?} across {} sites",
+            verdict,
+            sites.len()
+        );
+        for r in &results {
+            eprintln!(
+                "  [DEBUG/probe] {:24} [{:?}] {}",
+                r.host, r.verdict, r.detail
+            );
         }
-        let (sites, port) = {
-            let mut st = self.state.lock().unwrap();
-            st.probing = true;
-            st.view = View::Checking;
-            (
-                probe::parse_sites(&st.config.sites),
-                flags::parse_proxy_port(&st.config.flags),
-            )
+    }
+
+    let mut st = state.lock().unwrap();
+    st.probing = false;
+    st.last_check_results = results.clone();
+
+    match verdict {
+        Verdict::Pass => {
+            st.verify = Verify::Passed;
+            st.view = View::On;
+            st.checks_passed += 1;
+            st.last_check_detail = "All sites passed".into();
+            st.add_log("Check: all test sites passed through bypass.");
+            false
+        }
+        Verdict::Blocked => {
+            st.verify = Verify::Blocked;
+            st.view = View::Blocked;
+            st.checks_blocked += 1;
+            let reasons: Vec<String> = results
+                .iter()
+                .filter(|r| r.verdict != Verdict::Pass)
+                .map(|r| format!("{}: {}", r.host, r.detail))
+                .collect();
+            st.last_check_detail = reasons.join("; ");
+            let log_msg = format!("Check: DPI blocked sites: {}", st.last_check_detail);
+            st.add_log(log_msg);
+            st.config.autotune
+        }
+        Verdict::Unreachable => {
+            st.verify = Verify::Unreachable;
+            st.view = View::Unreachable;
+            st.last_check_detail = "Network unreachable".into();
+            st.add_log("Check: test sites unreachable (network issue, not DPI).");
+            false
+        }
+    }
+}
+
+fn sleep_cancellable(cancel: &Arc<AtomicBool>, dur: Duration) -> bool {
+    let deadline = Instant::now() + dur;
+    while Instant::now() < deadline {
+        if cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    !cancel.load(Ordering::SeqCst)
+}
+
+fn run_tune_loop(
+    state: &Arc<Mutex<AppState>>,
+    eng: &Arc<Mutex<Engine>>,
+    tx: &Sender<Ev>,
+    exe: &Path,
+    cancel: &Arc<AtomicBool>,
+) {
+    let (sites, port, min_ttl, max_ttl, base_flags) = {
+        let mut st = state.lock().unwrap();
+        st.tuning = true;
+        st.view = View::Tuning;
+        st.add_log("Starting autonomous TTL tuning...");
+        (
+            probe::parse_sites(&st.config.sites),
+            flags::parse_proxy_port(&st.config.flags),
+            st.config.ttl_min,
+            st.config.ttl_max,
+            st.config.flags.clone(),
+        )
+    };
+
+    // Ensure system proxy is configured if the user triggered Tune while bypass was Off.
+    proxy::set_socks_proxy(port);
+    let proxy: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut found_ttl = None;
+
+    if is_debug() {
+        eprintln!("[DEBUG/tune] Starting TTL tuning (range {min_ttl}..={max_ttl})");
+    }
+
+    for ttl in min_ttl..=max_ttl {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let candidate_flags = flags::with_ttl(&base_flags, ttl);
+        let effective_flags = if is_debug() && !flags::uses(&candidate_flags, "-x") {
+            format!("{candidate_flags} -x 1")
+        } else {
+            candidate_flags.clone()
+        };
+        let args = flags::tokenize(&effective_flags);
+
+        let started = {
+            let mut e = eng.lock().unwrap();
+            e.start(exe, &args, tx).ok().map(|pid| (pid, e.started_at))
         };
 
-        let proxy: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let (verdict, results) = probe::probe_all_via(&sites, Some(proxy));
-
-        if is_debug() {
-            eprintln!(
-                "[DEBUG/probe] Probe verdict: {:?} across {} sites",
-                verdict,
-                sites.len()
-            );
-            for r in &results {
-                eprintln!(
-                    "  [DEBUG/probe] {:24} [{:?}] {}",
-                    r.host, r.verdict, r.detail
-                );
+        if let Some((pid, started_at)) = started {
+            {
+                let mut st = state.lock().unwrap();
+                st.tuning_step = Some(ttl);
+                st.engine_pid = Some(pid);
+                st.started_at = started_at;
+                st.active_flags = candidate_flags.clone();
+                st.current_ttl = Some(ttl);
+                st.add_log(format!("Testing TTL {ttl}..."));
             }
-        }
 
-        let mut st = self.state.lock().unwrap();
-        st.probing = false;
-        st.last_check_results = results.clone();
-
-        match verdict {
-            Verdict::Pass => {
-                st.verify = Verify::Passed;
-                st.view = View::On;
-                st.checks_passed += 1;
-                st.last_check_detail = "All sites passed".into();
-                st.add_log("Check: all test sites passed through bypass.");
+            if !sleep_cancellable(cancel, Duration::from_millis(500)) {
+                break;
             }
-            Verdict::Blocked => {
-                st.verify = Verify::Blocked;
-                st.view = View::Blocked;
-                st.checks_blocked += 1;
-                let reasons: Vec<String> = results
+
+            let (v, results) = probe::probe_all_via(&sites, Some(proxy));
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+
+            if v == Verdict::Pass {
+                found_ttl = Some((ttl, candidate_flags));
+                break;
+            } else {
+                let mut st = state.lock().unwrap();
+                let detail: Vec<String> = results
                     .iter()
                     .filter(|r| r.verdict != Verdict::Pass)
                     .map(|r| format!("{}: {}", r.host, r.detail))
                     .collect();
-                st.last_check_detail = reasons.join("; ");
-                let log_msg = format!("Check: DPI blocked sites: {}", st.last_check_detail);
-                st.add_log(log_msg);
-            }
-            Verdict::Unreachable => {
-                st.verify = Verify::Unreachable;
-                st.view = View::Unreachable;
-                st.last_check_detail = "Network unreachable".into();
-                st.add_log("Check: test sites unreachable (network issue, not DPI).");
+                st.add_log(format!("TTL {ttl} did not pass ({})", detail.join(", ")));
             }
         }
     }
 
-    fn run_tune(&self, eng: &mut Engine, tx: &Sender<Ev>) {
-        let (sites, port, min_ttl, max_ttl, base_flags) = {
-            let mut st = self.state.lock().unwrap();
-            st.tuning = true;
-            st.view = View::Tuning;
-            st.add_log("Starting autonomous TTL tuning...");
-            (
-                probe::parse_sites(&st.config.sites),
-                flags::parse_proxy_port(&st.config.flags),
-                st.config.ttl_min,
-                st.config.ttl_max,
-                st.config.flags.clone(),
-            )
-        };
-
-        let proxy: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut found_ttl = None;
-
-        if is_debug() {
-            eprintln!("[DEBUG/tune] Starting TTL tuning (range {min_ttl}..={max_ttl})");
-        }
-
-        for ttl in min_ttl..=max_ttl {
-            {
-                let mut st = self.state.lock().unwrap();
-                st.tuning_step = Some(ttl);
-                st.add_log(format!("Testing TTL {ttl}..."));
-            }
-
-            let candidate_flags = flags::with_ttl(&base_flags, ttl);
-            let args = flags::tokenize(&candidate_flags);
-            if eng.start(&self.exe, &args, tx).is_ok() {
-                std::thread::sleep(Duration::from_millis(500));
-                let (v, results) = probe::probe_all_via(&sites, Some(proxy));
-                if v == Verdict::Pass {
-                    found_ttl = Some((ttl, candidate_flags));
-                    break;
-                } else {
-                    let mut st = self.state.lock().unwrap();
-                    let blocked_detail: Vec<String> = results
-                        .iter()
-                        .filter(|r| r.verdict != Verdict::Pass)
-                        .map(|r| format!("{}: {}", r.host, r.detail))
-                        .collect();
-                    st.add_log(format!("TTL {ttl} blocked ({})", blocked_detail.join(", ")));
-                }
-            }
-        }
-
-        let mut st = self.state.lock().unwrap();
+    if cancel.load(Ordering::SeqCst) {
+        let mut st = state.lock().unwrap();
         st.tuning = false;
+        st.probing = false;
         st.tuning_step = None;
+        return;
+    }
 
-        match found_ttl {
-            Some((ttl, new_flags)) => {
-                st.config.flags = new_flags.clone();
-                st.active_flags = new_flags.clone();
-                st.current_ttl = Some(ttl);
-                st.view = View::On;
-                st.verify = Verify::Passed;
-                let _ = st.config.save();
-                st.add_log(format!(
-                    "Tuning succeeded! Optimal TTL {ttl} found and saved to config."
-                ));
+    match found_ttl {
+        Some((ttl, new_flags)) => {
+            let mut st = state.lock().unwrap();
+            st.tuning = false;
+            st.tuning_step = None;
+            st.config.flags = new_flags.clone();
+            st.active_flags = new_flags;
+            st.current_ttl = Some(ttl);
+            st.view = View::On;
+            st.verify = Verify::Passed;
+            let _ = st.config.save();
+            st.add_log(format!(
+                "Tuning succeeded! Optimal TTL {ttl} found and saved to config."
+            ));
+        }
+        None => {
+            let effective_base = if is_debug() && !flags::uses(&base_flags, "-x") {
+                format!("{base_flags} -x 1")
+            } else {
+                base_flags.clone()
+            };
+            let args = flags::tokenize(&effective_base);
+            let restored = {
+                let mut e = eng.lock().unwrap();
+                e.start(exe, &args, tx).ok().map(|pid| (pid, e.started_at))
+            };
+            let mut st = state.lock().unwrap();
+            st.tuning = false;
+            st.tuning_step = None;
+            if let Some((pid, started_at)) = restored {
+                st.engine_pid = Some(pid);
+                st.started_at = started_at;
             }
-            None => {
-                // Restore base flags
-                let args = flags::tokenize(&base_flags);
-                let _ = eng.start(&self.exe, &args, tx);
-                st.view = View::Blocked;
-                st.verify = Verify::Blocked;
-                st.add_log(format!(
-                    "Tuning finished: No working TTL found in range {min_ttl}-{max_ttl}."
-                ));
-            }
+            st.active_flags = base_flags.clone();
+            st.current_ttl = flags::get_ttl(&base_flags);
+            st.view = View::Blocked;
+            st.verify = Verify::Blocked;
+            st.add_log(format!(
+                "Tuning finished: No working TTL found in range {min_ttl}-{max_ttl}."
+            ));
         }
     }
 }

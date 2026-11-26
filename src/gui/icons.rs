@@ -37,17 +37,23 @@ pub const ICO_BAD: &[u8] = include_bytes!("../../icons/ui/bad.ico");
 pub const ICO_PENDING: &[u8] = include_bytes!("../../icons/ui/pending.ico");
 pub const ICO_ROCKET: &[u8] = include_bytes!("../../icons/ui/rocket.ico");
 
-/// Decodes an embedded ICO file into an `egui::ColorImage` at the requested dimension.
-pub fn decode_ico(ico_bytes: &[u8], size: u32) -> ColorImage {
+/// Decodes an embedded ICO file into raw RGBA bytes at `size x size`.
+pub fn ico_to_rgba(ico_bytes: &[u8], size: u32) -> Vec<u8> {
     let img = image::load_from_memory(ico_bytes)
         .unwrap_or_else(|_| image::DynamicImage::new_rgba8(size, size));
-    let resized = img
-        .resize_exact(size, size, image::imageops::FilterType::Lanczos3)
-        .to_rgba8();
-    ColorImage::from_rgba_unmultiplied([size as usize, size as usize], resized.as_raw())
+    img.resize_exact(size, size, image::imageops::FilterType::Lanczos3)
+        .to_rgba8()
+        .into_raw()
+}
+
+/// Decodes an embedded ICO file into an `egui::ColorImage` at the requested dimension.
+pub fn decode_ico(ico_bytes: &[u8], size: u32) -> ColorImage {
+    let rgba = ico_to_rgba(ico_bytes, size);
+    ColorImage::from_rgba_unmultiplied([size as usize, size as usize], &rgba)
 }
 
 /// Converts embedded ICO bytes into a `ksni::Icon` (ARGB32 network byte order) for FreeDesktop tray.
+#[cfg(target_os = "linux")]
 pub fn ico_to_ksni_icon(ico_bytes: &[u8], size: u32) -> ksni::Icon {
     let img = image::load_from_memory(ico_bytes)
         .unwrap_or_else(|_| image::DynamicImage::new_rgba8(size, size));

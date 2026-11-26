@@ -10,6 +10,13 @@ use std::time::Duration;
 
 use super::state::{AppState, UiCmd, View};
 
+/// Removes the single-instance Unix domain socket on clean shutdown.
+#[cfg(target_os = "macos")]
+pub fn cleanup_instance_socket() {
+    let uid = unsafe { libc::getuid() };
+    let _ = std::fs::remove_file(format!("/tmp/sidestep-{uid}.sock"));
+}
+
 /// Sends a command to an existing running Sidestep instance via Unix domain socket.
 pub fn send_instance_cmd(cmd: &str) -> Option<String> {
     let uid = unsafe { libc::getuid() };
@@ -51,6 +58,7 @@ pub fn spawn_instance_listener(
         .spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut s = stream;
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
                 let mut buf = [0u8; 128];
                 if let Ok(n) = s.read(&mut buf) {
                     let line = String::from_utf8_lossy(&buf[..n]);
