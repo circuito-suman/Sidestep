@@ -100,7 +100,7 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 mod imp {
     use super::*;
     use std::path::PathBuf;
@@ -145,6 +145,101 @@ mod imp {
         if let Some(p) = autostart_path() {
             if p.exists() {
                 std::fs::remove_file(&p).map_err(|e| format!("removing autostart file: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn unregister_task(_name: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::*;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    const LABEL: &str = "com.cosmicinfinity.sidestep";
+
+    fn launch_agents_dir() -> Option<PathBuf> {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/LaunchAgents"))
+    }
+
+    fn plist_path() -> Option<PathBuf> {
+        launch_agents_dir().map(|d| d.join(format!("{LABEL}.plist")))
+    }
+
+    fn gui_domain() -> String {
+        let uid = unsafe { libc::getuid() };
+        format!("gui/{uid}")
+    }
+
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+
+    pub fn is_registered() -> bool {
+        plist_path().is_some_and(|p| p.is_file())
+    }
+
+    pub fn register(exe: &Path) -> Result<(), String> {
+        let dir = launch_agents_dir().ok_or("cannot determine user home directory")?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("creating LaunchAgents dir: {e}"))?;
+        let path = dir.join(format!("{LABEL}.plist"));
+        let log_dir = crate::setup::user_data_dir();
+        let _ = std::fs::create_dir_all(&log_dir);
+        let stdout_log = log_dir.join("Sidestep.log");
+
+        let plist = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n\
+             <dict>\n\
+             \t<key>Label</key>\n\
+             \t<string>{LABEL}</string>\n\
+             \t<key>ProgramArguments</key>\n\
+             \t<array>\n\
+             \t\t<string>{exe}</string>\n\
+             \t\t<string>daemon</string>\n\
+             \t</array>\n\
+             \t<key>RunAtLoad</key>\n\
+             \t<true/>\n\
+             \t<key>KeepAlive</key>\n\
+             \t<false/>\n\
+             \t<key>StandardOutPath</key>\n\
+             \t<string>{log}</string>\n\
+             \t<key>StandardErrorPath</key>\n\
+             \t<string>{log}</string>\n\
+             </dict>\n\
+             </plist>\n",
+            exe = xml_escape(&exe.display().to_string()),
+            log = xml_escape(&stdout_log.display().to_string()),
+        );
+
+        std::fs::write(&path, plist).map_err(|e| format!("writing LaunchAgent plist: {e}"))?;
+        // Ensure service target is enabled in launchd without spawning a duplicate daemon immediately.
+        let target = format!("{}/{LABEL}", gui_domain());
+        let _ = Command::new("launchctl").args(["enable", &target]).output();
+        Ok(())
+    }
+
+    pub fn unregister() -> Result<(), String> {
+        if let Some(p) = plist_path() {
+            if p.exists() {
+                let target = format!("{}/{LABEL}", gui_domain());
+                let _ = Command::new("launchctl")
+                    .args(["bootout", &target])
+                    .output();
+                let _ = Command::new("launchctl")
+                    .args(["unload", "-w"])
+                    .arg(&p)
+                    .output();
+                std::fs::remove_file(&p).map_err(|e| format!("removing LaunchAgent plist: {e}"))?;
             }
         }
         Ok(())

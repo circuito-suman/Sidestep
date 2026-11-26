@@ -18,8 +18,13 @@ nwg = { package = "native-windows-gui", version = "1.0.13", features = ["high-dp
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 eframe = { version = "0.31", default-features = true }
-ksni = { version = "0.3", features = ["blocking"] }
 image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", features = ["blocking"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = "0.19"
 
 [features]
 # Layout-check build: asInvoker manifest, --preview-main N / --preview-setup only.

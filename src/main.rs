@@ -9,20 +9,29 @@ pub mod engine;
 pub mod gui;
 #[cfg(windows)]
 pub mod kit;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub mod proxy;
+#[cfg(target_os = "macos")]
+#[path = "proxy_macos.rs"]
 pub mod proxy;
 pub mod setup;
 
 #[cfg(windows)]
 mod win_main;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 mod linux_main;
+
+#[cfg(target_os = "macos")]
+mod macos_main;
 
 fn main() {
     #[cfg(windows)]
     win_main::main();
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     linux_main::main();
+
+    #[cfg(target_os = "macos")]
+    macos_main::main();
 }
